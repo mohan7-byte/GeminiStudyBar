@@ -1,0 +1,1316 @@
+name: Build Gemini Study Bar EXE
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-windows-exe:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install google-genai PyQt6 PyQt6-WebEngine pillow sounddevice websockets aiohttp pyinstaller
+
+      - name: Generate Application Source (study_assistant.py)
+        shell: bash
+        run: |
+          cat << 'EOF' > study_assistant.py
+          import sys
+          import os
+          import io
+          import json
+          import hashlib
+          import asyncio
+          import threading
+          import queue
+          from pathlib import Path
+          from PIL import Image
+
+          from PyQt6.QtCore import (
+              Qt, QPoint, QSize, QThread, pyqtSignal, QBuffer, QIODevice, QTimer, QUrl
+          )
+          from PyQt6.QtGui import (
+              QGuiApplication, QPixmap, QImage, QFont, QColor, QCursor, QDesktopServices
+          )
+          from PyQt6.QtWidgets import (
+              QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit,
+              QPushButton, QLabel, QDialog, QComboBox, QPlainTextEdit,
+              QSlider, QCheckBox, QFrame, QTextBrowser, QMessageBox, QSizePolicy
+          )
+
+          try:
+              from PyQt6.QtWebEngineWidgets import QWebEngineView
+              HAS_WEBENGINE = True
+          except Exception:
+              HAS_WEBENGINE = False
+
+          try:
+              import sounddevice as sd
+              HAS_AUDIO = True
+          except Exception:
+              HAS_AUDIO = False
+
+          from google import genai
+          from google.genai import types
+
+          # ---------------------------------------------------------------------------
+          # Local Configuration Manager
+          # ---------------------------------------------------------------------------
+          CONFIG_DIR = Path.home() / ".gemini_study_bar"
+          CONFIG_FILE = CONFIG_DIR / "settings.json"
+
+          DEFAULT_CONFIG = {
+              "api_key": "",
+              "model_name": "gemini-3.8-flash",
+              "live_model_name": "gemini-2.5-flash-native-audio-preview-12-2025",
+              "thinking_level": "low",
+              "custom_instructions": (
+                  "You are a concise, clear study tutor. Use clean LaTeX math ($...$ for inline "
+                  "and $$...$$ for block equations). Highlight key formulas and final answers."
+              ),
+              "opacity": 95,
+              "auto_clipboard_snip": True
+          }
+
+          def load_config() -> dict:
+              CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+              if CONFIG_FILE.exists():
+                  try:
+                      data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                      merged = DEFAULT_CONFIG.copy()
+                      merged.update(data)
+                      return merged
+                  except Exception:
+                      pass
+              return DEFAULT_CONFIG.copy()
+
+          def save_config(cfg: dict):
+              CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+              CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
+          # ---------------------------------------------------------------------------
+          # HTML + KaTeX + Marked.js Template for Smooth Math & Markdown Rendering
+          # ---------------------------------------------------------------------------
+          HTML_TEMPLATE = """<!DOCTYPE html>
+          <html>
+          <head>
+          <meta charset="utf-8">
+          <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+          <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+          <script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+          <script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+          <style>
+            :root {
+              color-scheme: dark;
+            }
+            * { box-sizing: border-box; }
+            body {
+              margin: 0;
+              padding: 10px 12px;
+              background-color: #141418;
+              color: #ECECF1;
+              font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+              font-size: 13.5px;
+              line-height: 1.58;
+              overflow-x: hidden;
+            }
+            ::-webkit-scrollbar { width: 6px; }
+            ::-webkit-scrollbar-track { background: transparent; }
+            ::-webkit-scrollbar-thumb { background: #32343E; border-radius: 3px; }
+            .msg {
+              margin-bottom: 12px;
+              padding: 10px 14px;
+              border-radius: 14px;
+              word-wrap: break-word;
+            }
+            .msg.user {
+              background: #232733;
+              border: 1px solid #31374A;
+              color: #D8E6FF;
+              margin-left: 24px;
+            }
+            .msg.ai {
+              background: #1B1C22;
+              border: 1px solid #282A34;
+              color: #F1F3F5;
+            }
+            .msg.status {
+              background: rgba(138, 180, 248, 0.08);
+              border: 1px dashed #3B4D6B;
+              color: #9BB8ED;
+              font-size: 12px;
+              padding: 6px 10px;
+              text-align: center;
+            }
+            .role-tag {
+              font-size: 11px;
+              font-weight: 600;
+              text-transform: uppercase;
+              letter-spacing: 0.5px;
+              margin-bottom: 4px;
+              opacity: 0.65;
+            }
+            p { margin: 0 0 8px 0; }
+            p:last-child { margin-bottom: 0; }
+            pre {
+              background: #101115;
+              border: 1px solid #282A34;
+              padding: 8px 10px;
+              border-radius: 8px;
+              overflow-x: auto;
+              font-family: "Cascadia Code", Consolas, monospace;
+              font-size: 12.5px;
+            }
+            code {
+              background: #23252E;
+              padding: 1px 5px;
+              border-radius: 5px;
+              font-family: "Cascadia Code", Consolas, monospace;
+              font-size: 12.5px;
+            }
+            pre code { background: transparent; padding: 0; }
+            .katex-display {
+              margin: 10px 0;
+              overflow-x: auto;
+              overflow-y: hidden;
+              padding: 4px 0;
+            }
+          </style>
+          </head>
+          <body>
+            <div id="chat"></div>
+            <script>
+              const chat = document.getElementById('chat');
+
+              function renderMathSafe(el) {
+                if (typeof renderMathInElement === 'function') {
+                  try {
+                    renderMathInElement(el, {
+                      delimiters: [
+                        {left: '$$', right: '$$', display: true},
+                        {left: '$', right: '$', display: false},
+                        {left: '\\\\(', right: '\\\\)', display: false},
+                        {left: '\\\\[', right: '\\\\]', display: true}
+                      ],
+                      throwOnError: false
+                    });
+                  } catch (e) {}
+                }
+              }
+
+              function formatMarkdownWithMath(rawText) {
+                // Protect math blocks from Marked.js mangling underscores/asterisks
+                const mathBlocks = [];
+                let protectedText = rawText.replace(/(\\$\\$[\\s\\S]*?\\$\\$|\\$[^\\$\\n]+?\\$)/g, (match) => {
+                  mathBlocks.push(match);
+                  return `@@MATH_BLOCK_${mathBlocks.length - 1}@@`;
+                });
+
+                let html = (typeof marked !== 'undefined')
+                  ? marked.parse(protectedText)
+                  : protectedText.replace(/\\n/g, '<br>');
+
+                html = html.replace(/@@MATH_BLOCK_(\\d+)@@/g, (_, idx) => mathBlocks[Number(idx)]);
+                return html;
+              }
+
+              window.addMessage = function(role, rawText) {
+                const div = document.createElement('div');
+                div.className = 'msg ' + role;
+                if (role === 'status') {
+                  div.textContent = rawText;
+                } else {
+                  const tag = document.createElement('div');
+                  tag.className = 'role-tag';
+                  tag.textContent = role === 'user' ? 'You' : 'Gemini';
+                  const body = document.createElement('div');
+                  body.className = 'msg-body';
+                  body.innerHTML = formatMarkdownWithMath(rawText);
+                  div.appendChild(tag);
+                  div.appendChild(body);
+                  renderMathSafe(body);
+                }
+                chat.appendChild(div);
+                window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+              };
+
+              window.updateStreamingAI = function(rawText) {
+                let last = chat.lastElementChild;
+                if (!last || !last.classList.contains('streaming')) {
+                  last = document.createElement('div');
+                  last.className = 'msg ai streaming';
+                  const tag = document.createElement('div');
+                  tag.className = 'role-tag';
+                  tag.textContent = 'Gemini';
+                  const body = document.createElement('div');
+                  body.className = 'msg-body';
+                  last.appendChild(tag);
+                  last.appendChild(body);
+                  chat.appendChild(last);
+                }
+                const body = last.querySelector('.msg-body');
+                body.innerHTML = formatMarkdownWithMath(rawText);
+                renderMathSafe(body);
+                window.scrollTo({ top: document.body.scrollHeight });
+              };
+
+              window.finalizeStreamingAI = function() {
+                let last = chat.lastElementChild;
+                if (last && last.classList.contains('streaming')) {
+                  last.classList.remove('streaming');
+                }
+              };
+
+              window.clearChat = function() {
+                chat.innerHTML = '';
+              };
+            </script>
+          </body>
+          </html>
+          """
+
+
+          # ---------------------------------------------------------------------------
+          # Standard & Streaming Chat Worker (Multi-Turn Memory + Thinking Level)
+          # ---------------------------------------------------------------------------
+          class ChatStreamWorker(QThread):
+              chunk_signal = pyqtSignal(str)
+              done_signal = pyqtSignal(str)
+              error_signal = pyqtSignal(str)
+
+              def __init__(self, api_key: str, model_name: str, thinking_level: str,
+                           system_instruction: str, history: list, user_text: str,
+                           pil_image=None):
+                  super().__init__()
+                  self.api_key = api_key.strip()
+                  self.model_name = model_name.strip() or "gemini-3.8-flash"
+                  self.thinking_level = thinking_level.strip().lower()
+                  self.system_instruction = system_instruction.strip()
+                  self.history = history
+                  self.user_text = user_text
+                  self.pil_image = pil_image
+                  self._abort = False
+
+              def stop(self):
+                  self._abort = True
+
+              def _build_config(self, include_thinking=True):
+                  kwargs = {}
+                  if self.system_instruction:
+                      kwargs["system_instruction"] = self.system_instruction
+                  if include_thinking and self.thinking_level in ("minimal", "low", "medium", "high"):
+                      try:
+                          kwargs["thinking_config"] = types.ThinkingConfig(
+                              thinking_level=self.thinking_level
+                          )
+                      except Exception:
+                          pass
+                  return types.GenerateContentConfig(**kwargs)
+
+              def run(self):
+                  try:
+                      client = genai.Client(api_key=self.api_key)
+                      contents = list(self.history)
+
+                      parts = []
+                      if self.pil_image is not None:
+                          buf = io.BytesIO()
+                          self.pil_image.convert("RGB").save(buf, format="JPEG", quality=88)
+                          parts.append(
+                              types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg")
+                          )
+                      parts.append(types.Part.from_text(text=self.user_text))
+                      user_content = types.Content(role="user", parts=parts)
+                      contents.append(user_content)
+
+                      full_text = ""
+                      try:
+                          stream = client.models.generate_content_stream(
+                              model=self.model_name,
+                              contents=contents,
+                              config=self._build_config(include_thinking=True)
+                          )
+                          for chunk in stream:
+                              if self._abort:
+                                  break
+                              if getattr(chunk, "text", None):
+                                  full_text += chunk.text
+                                  self.chunk_signal.emit(full_text)
+                      except Exception as first_err:
+                          # Fallback if the chosen model does not support thinking_level
+                          if "thinking" in str(first_err).lower():
+                              stream = client.models.generate_content_stream(
+                                  model=self.model_name,
+                                  contents=contents,
+                                  config=self._build_config(include_thinking=False)
+                              )
+                              for chunk in stream:
+                                  if self._abort:
+                                      break
+                                  if getattr(chunk, "text", None):
+                                      full_text += chunk.text
+                                      self.chunk_signal.emit(full_text)
+                          else:
+                              raise first_err
+
+                      if not self._abort:
+                          self.done_signal.emit(full_text or "(No text returned)")
+                  except Exception as e:
+                      self.error_signal.emit(str(e))
+
+
+          # ---------------------------------------------------------------------------
+          # Gemini Live WebSocket Worker (Bidirectional Audio + Screen Snip + Text)
+          # ---------------------------------------------------------------------------
+          class LiveWebSocketWorker(QThread):
+              status_signal = pyqtSignal(str)
+              transcript_signal = pyqtSignal(str, str)
+              error_signal = pyqtSignal(str)
+              stopped_signal = pyqtSignal()
+
+              def __init__(self, api_key: str, live_model: str, system_instruction: str):
+                  super().__init__()
+                  self.api_key = api_key.strip()
+                  self.live_model = live_model.strip() or "gemini-2.5-flash-native-audio-preview-12-2025"
+                  self.system_instruction = system_instruction.strip()
+                  self.running = False
+                  self.out_queue = queue.Queue()
+
+              def send_text(self, text: str):
+                  self.out_queue.put(("text", text))
+
+              def send_image(self, pil_image: Image.Image):
+                  buf = io.BytesIO()
+                  pil_image.convert("RGB").save(buf, format="JPEG", quality=80)
+                  self.out_queue.put(("image", buf.getvalue()))
+
+              def stop(self):
+                  self.running = False
+                  self.out_queue.put(("stop", None))
+
+              async def _session_loop(self):
+                  client = genai.Client(api_key=self.api_key)
+                  cfg_kwargs = {
+                      "response_modalities": ["AUDIO"],
+                      "output_audio_transcription": types.AudioTranscriptionConfig(),
+                      "input_audio_transcription": types.AudioTranscriptionConfig(),
+                  }
+                  if self.system_instruction:
+                      cfg_kwargs["system_instruction"] = types.Content(
+                          parts=[types.Part.from_text(text=self.system_instruction)]
+                      )
+                  config = types.LiveConnectConfig(**cfg_kwargs)
+
+                  self.status_signal.emit(f"Connecting Live ({self.live_model})...")
+                  async with client.aio.live.connect(model=self.live_model, config=config) as session:
+                      self.status_signal.emit("🎙 Live Active — Speak or snip a question!")
+
+                      audio_out_q = queue.Queue()
+                      mic_stream = None
+                      spk_stream = None
+
+                      if HAS_AUDIO:
+                          def mic_callback(indata, frames, time_info, status):
+                              if self.running:
+                                  self.out_queue.put(("audio", bytes(indata)))
+
+                          def spk_writer():
+                              try:
+                                  with sd.RawOutputStream(samplerate=24000, channels=1, dtype="int16") as spk:
+                                      while self.running:
+                                          try:
+                                              pcm = audio_out_q.get(timeout=0.2)
+                                              if pcm:
+                                                  spk.write(pcm)
+                                          except queue.Empty:
+                                              continue
+                              except Exception:
+                                  pass
+
+                          threading.Thread(target=spk_writer, daemon=True).start()
+                          try:
+                              mic_stream = sd.RawInputStream(
+                                  samplerate=16000, channels=1, dtype="int16",
+                                  blocksize=1600, callback=mic_callback
+                              )
+                              mic_stream.start()
+                          except Exception as mic_err:
+                              self.status_signal.emit(f"Live connected (Mic unavailable: {mic_err})")
+
+                      async def sender():
+                          while self.running:
+                              try:
+                                  kind, payload = self.out_queue.get_nowait()
+                                  if kind == "stop":
+                                      break
+                                  elif kind == "audio":
+                                      await session.send_realtime_input(
+                                          audio=types.Blob(data=payload, mime_type="audio/pcm;rate=16000")
+                                      )
+                                  elif kind == "image":
+                                      await session.send_realtime_input(
+                                          video=types.Blob(data=payload, mime_type="image/jpeg")
+                                      )
+                                      self.status_signal.emit("📸 Sent screen snip to Live session")
+                                  elif kind == "text":
+                                      await session.send_realtime_input(text=payload)
+                              except queue.Empty:
+                                  await asyncio.sleep(0.02)
+
+                      async def receiver():
+                          ai_text_acc = ""
+                          while self.running:
+                              async for response in session.receive():
+                                  if not self.running:
+                                      break
+                                  sc = getattr(response, "server_content", None)
+                                  if not sc:
+                                      continue
+                                  if getattr(sc, "model_turn", None):
+                                      for part in sc.model_turn.parts:
+                                          if getattr(part, "inline_data", None) and part.inline_data.data:
+                                              audio_out_q.put(part.inline_data.data)
+                                          if getattr(part, "text", None):
+                                              ai_text_acc += part.text
+                                              self.transcript_signal.emit("ai_stream", ai_text_acc)
+                                  if getattr(sc, "output_transcription", None) and sc.output_transcription.text:
+                                      ai_text_acc += sc.output_transcription.text
+                                      self.transcript_signal.emit("ai_stream", ai_text_acc)
+                                  if getattr(sc, "turn_complete", False) and ai_text_acc:
+                                      self.transcript_signal.emit("ai_done", ai_text_acc)
+                                      ai_text_acc = ""
+
+                      try:
+                          await asyncio.gather(sender(), receiver())
+                      finally:
+                          if mic_stream:
+                              try:
+                                  mic_stream.stop()
+                                  mic_stream.close()
+                              except Exception:
+                                  pass
+
+              def run(self):
+                  self.running = True
+                  try:
+                      asyncio.run(self._session_loop())
+                  except Exception as e:
+                      if self.running:
+                          self.error_signal.emit(f"Live Mode Error: {e}")
+                  finally:
+                      self.running = False
+                      self.stopped_signal.emit()
+
+
+          # ---------------------------------------------------------------------------
+          # Settings Dialog (Dotted API Key, Editable Model Names, Thinking, Opacity)
+          # ---------------------------------------------------------------------------
+          class SettingsDialog(QDialog):
+              def __init__(self, parent, config: dict):
+                  super().__init__(parent)
+                  self.setWindowTitle("Study Bar Settings")
+                  self.setFixedSize(430, 500)
+                  self.config = config.copy()
+                  self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowStaysOnTopHint)
+                  self.setStyleSheet("""
+                      QDialog {
+                          background-color: #16171D;
+                          color: #ECECF1;
+                          font-family: "Segoe UI", sans-serif;
+                      }
+                      QLabel {
+                          color: #C9CCD6;
+                          font-size: 12px;
+                          font-weight: 600;
+                      }
+                      QLineEdit, QComboBox, QPlainTextEdit {
+                          background-color: #21232C;
+                          border: 1px solid #323544;
+                          border-radius: 8px;
+                          padding: 6px 10px;
+                          color: #FFFFFF;
+                          font-size: 13px;
+                      }
+                      QLineEdit:focus, QComboBox:focus, QPlainTextEdit:focus {
+                          border: 1px solid #8AB4F8;
+                      }
+                      QPushButton {
+                          background-color: #282B36;
+                          border: 1px solid #383C4C;
+                          border-radius: 8px;
+                          padding: 7px 14px;
+                          color: #ECECF1;
+                          font-weight: 600;
+                      }
+                      QPushButton#saveBtn {
+                          background-color: #8AB4F8;
+                          color: #101218;
+                          border: none;
+                      }
+                      QPushButton#saveBtn:hover {
+                          background-color: #A3C5FA;
+                      }
+                      QCheckBox {
+                          color: #D5D8E2;
+                          font-size: 12.5px;
+                      }
+                  """)
+
+                  layout = QVBoxLayout(self)
+                  layout.setSpacing(10)
+                  layout.setContentsMargins(18, 18, 18, 18)
+
+                  # 1. API Key (Dotted Password Mode + Show Toggle)
+                  layout.addWidget(QLabel("Google Gemini API Key (Saved Locally):"))
+                  key_row = QHBoxLayout()
+                  self.key_edit = QLineEdit(self.config.get("api_key", ""))
+                  self.key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+                  self.key_edit.setPlaceholderText("Paste your AI Studio API key...")
+                  self.show_key_btn = QPushButton("Show")
+                  self.show_key_btn.setFixedWidth(60)
+                  self.show_key_btn.clicked.connect(self._toggle_key_visibility)
+                  key_row.addWidget(self.key_edit)
+                  key_row.addWidget(self.show_key_btn)
+                  layout.addLayout(key_row)
+
+                  # 2. Editable Standard Model Selector
+                  layout.addWidget(QLabel("Study Model (Select or type any future model name):"))
+                  self.model_combo = QComboBox()
+                  self.model_combo.setEditable(True)
+                  presets = [
+                      "gemini-3.8-flash",
+                      "gemini-3.1-pro-preview",
+                      "gemini-2.5-flash",
+                      "gemini-2.5-pro"
+                  ]
+                  current_model = self.config.get("model_name", "gemini-3.8-flash")
+                  if current_model not in presets:
+                      presets.insert(0, current_model)
+                  self.model_combo.addItems(presets)
+                  self.model_combo.setCurrentText(current_model)
+                  layout.addWidget(self.model_combo)
+
+                  # 3. Thinking Level Selector
+                  layout.addWidget(QLabel("Thinking Level (Lower = fewer tokens & faster):"))
+                  self.thinking_combo = QComboBox()
+                  self.thinking_combo.addItems(["low", "medium", "high", "minimal"])
+                  self.thinking_combo.setCurrentText(self.config.get("thinking_level", "low"))
+                  layout.addWidget(self.thinking_combo)
+
+                  # 4. Editable Live WebSocket Model Selector
+                  layout.addWidget(QLabel("Gemini Live WebSocket Model (Select or type):"))
+                  self.live_model_combo = QComboBox()
+                  self.live_model_combo.setEditable(True)
+                  live_presets = [
+                      "gemini-2.5-flash-native-audio-preview-12-2025",
+                      "gemini-3.8-live",
+                      "gemini-live-2.5-flash-preview"
+                  ]
+                  curr_live = self.config.get("live_model_name", live_presets[0])
+                  if curr_live not in live_presets:
+                      live_presets.insert(0, curr_live)
+                  self.live_model_combo.addItems(live_presets)
+                  self.live_model_combo.setCurrentText(curr_live)
+                  layout.addWidget(self.live_model_combo)
+
+                  # 5. Custom Permanent Instructions
+                  layout.addWidget(QLabel("Custom Study Instructions (Applied to every session):"))
+                  self.inst_edit = QPlainTextEdit(self.config.get("custom_instructions", ""))
+                  self.inst_edit.setFixedHeight(85)
+                  layout.addWidget(self.inst_edit)
+
+                  # 6. Opacity Slider + Auto Win+Shift+S Toggle
+                  op_row = QHBoxLayout()
+                  self.op_label = QLabel(f"Window Opacity: {self.config.get('opacity', 95)}%")
+                  self.op_slider = QSlider(Qt.Orientation.Horizontal)
+                  self.op_slider.setRange(35, 100)
+                  self.op_slider.setValue(int(self.config.get("opacity", 95)))
+                  self.op_slider.valueChanged.connect(
+                      lambda v: self.op_label.setText(f"Window Opacity: {v}%")
+                  )
+                  op_row.addWidget(self.op_label)
+                  op_row.addWidget(self.op_slider)
+                  layout.addLayout(op_row)
+
+                  self.clip_check = QCheckBox(
+                      "Auto-detect Win + Shift + S screen snips from clipboard"
+                  )
+                  self.clip_check.setChecked(bool(self.config.get("auto_clipboard_snip", True)))
+                  layout.addWidget(self.clip_check)
+
+                  # Save / Cancel Buttons
+                  btn_row = QHBoxLayout()
+                  btn_row.addStretch()
+                  cancel_btn = QPushButton("Cancel")
+                  cancel_btn.clicked.connect(self.reject)
+                  save_btn = QPushButton("Save Settings")
+                  save_btn.setObjectName("saveBtn")
+                  save_btn.clicked.connect(self._save)
+                  btn_row.addWidget(cancel_btn)
+                  btn_row.addWidget(save_btn)
+                  layout.addLayout(btn_row)
+
+              def _toggle_key_visibility(self):
+                  if self.key_edit.echoMode() == QLineEdit.EchoMode.Password:
+                      self.key_edit.setEchoMode(QLineEdit.EchoMode.Normal)
+                      self.show_key_btn.setText("Hide")
+                  else:
+                      self.key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+                      self.show_key_btn.setText("Show")
+
+              def _save(self):
+                  self.config["api_key"] = self.key_edit.text().strip()
+                  self.config["model_name"] = self.model_combo.currentText().strip()
+                  self.config["thinking_level"] = self.thinking_combo.currentText().strip()
+                  self.config["live_model_name"] = self.live_model_combo.currentText().strip()
+                  self.config["custom_instructions"] = self.inst_edit.toPlainText().strip()
+                  self.config["opacity"] = self.op_slider.value()
+                  self.config["auto_clipboard_snip"] = self.clip_check.isChecked()
+                  save_config(self.config)
+                  self.accept()
+
+
+          # ---------------------------------------------------------------------------
+          # Main Floating Orb + Floating Bar + Expandable Rounded Response App
+          # ---------------------------------------------------------------------------
+          class StudyAssistantApp(QWidget):
+              def __init__(self):
+                  super().__init__()
+                  self.config = load_config()
+                  self.chat_history = []
+                  self.attached_pil_image = None
+                  self.chat_worker = None
+                  self.live_worker = None
+                  self.drag_pos = QPoint()
+
+                  # Track clipboard image hash so startup clipboard does not false-trigger
+                  self.last_clip_hash = self._current_clipboard_image_hash()
+
+                  self._init_ui()
+                  self._apply_opacity()
+
+                  # Listen to Windows Clipboard for Win + Shift + S snips
+                  QApplication.clipboard().dataChanged.connect(self._on_clipboard_changed)
+
+              def _init_ui(self):
+                  self.setWindowTitle("Gemini Study Bar")
+                  self.setWindowFlags(
+                      Qt.WindowType.FramelessWindowHint
+                      | Qt.WindowType.WindowStaysOnTopHint
+                      | Qt.WindowType.Tool
+                  )
+                  self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+
+                  self.root_layout = QVBoxLayout(self)
+                  self.root_layout.setContentsMargins(6, 6, 6, 6)
+                  self.root_layout.setSpacing(0)
+
+                  # 1. Minimal Floating Pill Button (When collapsed to avoid blocking PDF)
+                  self.orb_btn = QPushButton("✦ Study AI")
+                  self.orb_btn.setFixedSize(108, 38)
+                  self.orb_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+                  self.orb_btn.setToolTip("Click to open Floating Study Bar (Drag to move)")
+                  self.orb_btn.setStyleSheet("""
+                      QPushButton {
+                          background-color: rgba(20, 21, 27, 235);
+                          color: #8AB4F8;
+                          border: 1px solid #343848;
+                          border-radius: 19px;
+                          font-family: "Segoe UI", sans-serif;
+                          font-size: 13px;
+                          font-weight: 700;
+                      }
+                      QPushButton:hover {
+                          background-color: rgba(32, 35, 45, 250);
+                          border: 1px solid #8AB4F8;
+                      }
+                  """)
+                  self.orb_btn.clicked.connect(self.expand_from_orb)
+                  self.orb_btn.hide()
+                  self.root_layout.addWidget(self.orb_btn)
+
+                  # 2. Main Rounded Container Card
+                  self.card = QFrame()
+                  self.card.setObjectName("mainCard")
+                  self.card.setStyleSheet("""
+                      QFrame#mainCard {
+                          background-color: rgba(20, 20, 25, 246);
+                          border: 1px solid #2D303E;
+                          border-radius: 18px;
+                      }
+                      QLabel#brandLabel {
+                          color: #ECECF1;
+                          font-family: "Segoe UI", sans-serif;
+                          font-size: 12.5px;
+                          font-weight: 700;
+                      }
+                      QLabel#badgeLabel {
+                          color: #8AB4F8;
+                          background-color: rgba(138, 180, 248, 0.12);
+                          border-radius: 8px;
+                          padding: 2px 7px;
+                          font-size: 11px;
+                          font-weight: 600;
+                      }
+                      QLineEdit#queryInput {
+                          background-color: #1E2029;
+                          border: 1px solid #303444;
+                          border-radius: 13px;
+                          padding: 8px 12px;
+                          color: #FFFFFF;
+                          font-size: 13.5px;
+                      }
+                      QLineEdit#queryInput:focus {
+                          border: 1px solid #8AB4F8;
+                      }
+                      QPushButton.iconBtn {
+                          background-color: #20222B;
+                          border: 1px solid #2F3240;
+                          border-radius: 10px;
+                          color: #D9DCE6;
+                          padding: 4px 9px;
+                          font-size: 12px;
+                          font-weight: 600;
+                      }
+                      QPushButton.iconBtn:hover {
+                          background-color: #2B2E3B;
+                          border: 1px solid #4A5068;
+                      }
+                      QPushButton.pillBtn {
+                          background-color: #1F222D;
+                          border: 1px solid #2F3546;
+                          border-radius: 11px;
+                          color: #B8C7E0;
+                          padding: 4px 10px;
+                          font-size: 11.5px;
+                          font-weight: 600;
+                      }
+                      QPushButton.pillBtn:hover {
+                          background-color: #2A3042;
+                          color: #FFFFFF;
+                          border: 1px solid #8AB4F8;
+                      }
+                  """)
+
+                  card_layout = QVBoxLayout(self.card)
+                  card_layout.setContentsMargins(12, 10, 12, 10)
+                  card_layout.setSpacing(8)
+
+                  # Top Header Bar
+                  top_row = QHBoxLayout()
+                  top_row.setSpacing(6)
+
+                  self.title_lbl = QLabel("✦ Study AI")
+                  self.title_lbl.setObjectName("brandLabel")
+                  top_row.addWidget(self.title_lbl)
+
+                  self.model_badge = QLabel()
+                  self.model_badge.setObjectName("badgeLabel")
+                  self._update_badge()
+                  top_row.addWidget(self.model_badge)
+
+                  top_row.addStretch()
+
+                  # Screen Snip Button (Triggers Windows Win+Shift+S Snipping Tool)
+                  self.snip_btn = QPushButton("📸 Snip")
+                  self.snip_btn.setProperty("class", "iconBtn")
+                  self.snip_btn.setToolTip("Trigger Win + Shift + S screen snip")
+                  self.snip_btn.clicked.connect(self.trigger_screen_snip)
+                  top_row.addWidget(self.snip_btn)
+
+                  # Live WebSocket Mode Toggle Button
+                  self.live_btn = QPushButton("🎙 Live")
+                  self.live_btn.setProperty("class", "iconBtn")
+                  self.live_btn.setToolTip("Start/Stop Gemini Live real-time voice & screen session")
+                  self.live_btn.clicked.connect(self.toggle_live_mode)
+                  top_row.addWidget(self.live_btn)
+
+                  # New Session / Clear Memory Button
+                  self.clear_btn = QPushButton("🔄 New")
+                  self.clear_btn.setProperty("class", "iconBtn")
+                  self.clear_btn.setToolTip("Stop current generation & start a fresh question session")
+                  self.clear_btn.clicked.connect(self.reset_session)
+                  top_row.addWidget(self.clear_btn)
+
+                  # Settings Button
+                  self.settings_btn = QPushButton("⚙")
+                  self.settings_btn.setProperty("class", "iconBtn")
+                  self.settings_btn.setToolTip("Settings (API Key, Model, Thinking Level, Instructions)")
+                  self.settings_btn.clicked.connect(self.open_settings)
+                  top_row.addWidget(self.settings_btn)
+
+                  # Collapse to Tiny Floating Button
+                  self.min_btn = QPushButton("—")
+                  self.min_btn.setProperty("class", "iconBtn")
+                  self.min_btn.setToolTip("Collapse into tiny floating button")
+                  self.min_btn.clicked.connect(self.collapse_to_orb)
+                  top_row.addWidget(self.min_btn)
+
+                  # Close App Button
+                  self.close_btn = QPushButton("✕")
+                  self.close_btn.setProperty("class", "iconBtn")
+                  self.close_btn.setToolTip("Exit Study Bar")
+                  self.close_btn.clicked.connect(self.close)
+                  top_row.addWidget(self.close_btn)
+
+                  card_layout.addLayout(top_row)
+
+                  # Input Row
+                  input_row = QHBoxLayout()
+                  input_row.setSpacing(6)
+
+                  self.query_input = QLineEdit()
+                  self.query_input.setObjectName("queryInput")
+                  self.query_input.setPlaceholderText("Ask about your PDF or press Win+Shift+S...")
+                  self.query_input.returnPressed.connect(lambda: self.submit_query(mode="normal"))
+                  input_row.addWidget(self.query_input)
+
+                  self.send_btn = QPushButton("Ask ↵")
+                  self.send_btn.setProperty("class", "iconBtn")
+                  self.send_btn.setStyleSheet(
+                      "background-color: #8AB4F8; color: #101218; border: none; "
+                      "border-radius: 11px; padding: 7px 13px; font-weight: 700;"
+                  )
+                  self.send_btn.clicked.connect(lambda: self.submit_query(mode="normal"))
+                  input_row.addWidget(self.send_btn)
+
+                  card_layout.addLayout(input_row)
+
+                  # Quick Action Pills Row (Hint Only, Step-by-Step, Attached Snip Badge, Stop)
+                  pills_row = QHBoxLayout()
+                  pills_row.setSpacing(6)
+
+                  self.hint_btn = QPushButton("💡 Hint Only")
+                  self.hint_btn.setProperty("class", "pillBtn")
+                  self.hint_btn.clicked.connect(lambda: self.submit_query(mode="hint"))
+                  pills_row.addWidget(self.hint_btn)
+
+                  self.step_btn = QPushButton("📝 Step-by-Step")
+                  self.step_btn.setProperty("class", "pillBtn")
+                  self.step_btn.clicked.connect(lambda: self.submit_query(mode="steps"))
+                  pills_row.addWidget(self.step_btn)
+
+                  self.snip_badge_btn = QPushButton("📎 Snip Attached ✕")
+                  self.snip_badge_btn.setProperty("class", "pillBtn")
+                  self.snip_badge_btn.setStyleSheet(
+                      "background-color: rgba(129, 201, 149, 0.16); color: #81C995; "
+                      "border: 1px solid #3C6E4B; border-radius: 11px; padding: 4px 10px; font-size: 11.5px;"
+                  )
+                  self.snip_badge_btn.setToolTip("Click to remove attached screenshot")
+                  self.snip_badge_btn.clicked.connect(self.clear_attached_snip)
+                  self.snip_badge_btn.hide()
+                  pills_row.addWidget(self.snip_badge_btn)
+
+                  pills_row.addStretch()
+
+                  self.stop_btn = QPushButton("⏹ Stop")
+                  self.stop_btn.setProperty("class", "pillBtn")
+                  self.stop_btn.setStyleSheet(
+                      "background-color: rgba(242, 139, 130, 0.16); color: #F28B82; "
+                      "border: 1px solid #6E3B37; border-radius: 11px; padding: 4px 10px;"
+                  )
+                  self.stop_btn.clicked.connect(self.stop_active_generation)
+                  self.stop_btn.hide()
+                  pills_row.addWidget(self.stop_btn)
+
+                  self.toggle_panel_btn = QPushButton("▾ Hide Answer")
+                  self.toggle_panel_btn.setProperty("class", "pillBtn")
+                  self.toggle_panel_btn.clicked.connect(self.toggle_response_panel)
+                  self.toggle_panel_btn.hide()
+                  pills_row.addWidget(self.toggle_panel_btn)
+
+                  card_layout.addLayout(pills_row)
+
+                  # Expandable Response View (WebEngine with KaTeX or Fallback TextBrowser)
+                  self.response_container = QFrame()
+                  resp_layout = QVBoxLayout(self.response_container)
+                  resp_layout.setContentsMargins(0, 4, 0, 0)
+
+                  self.use_webengine = False
+                  if HAS_WEBENGINE:
+                      try:
+                          self.web_view = QWebEngineView()
+                          self.web_view.page().setBackgroundColor(QColor("#141418"))
+                          self.web_view.setHtml(HTML_TEMPLATE)
+                          self.web_view.setMinimumHeight(330)
+                          resp_layout.addWidget(self.web_view)
+                          self.use_webengine = True
+                      except Exception:
+                          self.use_webengine = False
+
+                  if not self.use_webengine:
+                      self.text_browser = QTextBrowser()
+                      self.text_browser.setOpenExternalLinks(True)
+                      self.text_browser.setMinimumHeight(330)
+                      self.text_browser.setStyleSheet(
+                          "background-color: #141418; color: #ECECF1; border: 1px solid #282A34; "
+                          "border-radius: 12px; padding: 10px; font-size: 13.5px;"
+                      )
+                      resp_layout.addWidget(self.text_browser)
+
+                  self.response_container.hide()
+                  card_layout.addWidget(self.response_container)
+
+                  self.root_layout.addWidget(self.card)
+
+                  # Position nicely near top-right of primary screen
+                  self.resize(470, 128)
+                  screen_geo = QGuiApplication.primaryScreen().availableGeometry()
+                  self.move(screen_geo.right() - 500, screen_geo.top() + 40)
+
+              # -----------------------------------------------------------------------
+              # Helpers for UI State, Dragging & Opacity
+              # -----------------------------------------------------------------------
+              def _update_badge(self):
+                  model = self.config.get("model_name", "gemini-3.8-flash")
+                  think = self.config.get("thinking_level", "low")
+                  self.model_badge.setText(f"{model} · {think}")
+
+              def _apply_opacity(self):
+                  op = max(0.35, min(1.0, float(self.config.get("opacity", 95)) / 100.0))
+                  self.setWindowOpacity(op)
+
+              def collapse_to_orb(self):
+                  self.card.hide()
+                  self.orb_btn.show()
+                  self.resize(120, 50)
+
+              def expand_from_orb(self):
+                  self.orb_btn.hide()
+                  self.card.show()
+                  if self.response_container.isVisible():
+                      self.resize(470, 480)
+                  else:
+                      self.resize(470, 128)
+
+              def show_response_panel(self):
+                  if self.orb_btn.isVisible():
+                      self.orb_btn.hide()
+                      self.card.show()
+                  if not self.response_container.isVisible():
+                      self.response_container.show()
+                      self.toggle_panel_btn.setText("▴ Hide Answer")
+                      self.toggle_panel_btn.show()
+                      self.resize(470, 480)
+
+              def toggle_response_panel(self):
+                  if self.response_container.isVisible():
+                      self.response_container.hide()
+                      self.toggle_panel_btn.setText("▾ Show Answer")
+                      self.resize(470, 128)
+                  else:
+                      self.response_container.show()
+                      self.toggle_panel_btn.setText("▴ Hide Answer")
+                      self.resize(470, 480)
+
+              def mousePressEvent(self, event):
+                  if event.button() == Qt.MouseButton.LeftButton:
+                      self.drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+                      event.accept()
+
+              def mouseMoveEvent(self, event):
+                  if event.buttons() & Qt.MouseButton.LeftButton and not self.drag_pos.isNull():
+                      self.move(event.globalPosition().toPoint() - self.drag_pos)
+                      event.accept()
+
+              # -----------------------------------------------------------------------
+              # Automatic Win + Shift + S Clipboard Screen Snip Detection
+              # -----------------------------------------------------------------------
+              def _current_clipboard_image_hash(self):
+                  cb = QApplication.clipboard()
+                  mime = cb.mimeData()
+                  if mime and mime.hasImage():
+                      qimg = cb.image()
+                      if not qimg.isNull():
+                          ba = QBuffer()
+                          ba.open(QIODevice.OpenModeFlag.WriteOnly)
+                          qimg.save(ba, "PNG")
+                          return hashlib.sha1(bytes(ba.data())).hexdigest()
+                  return None
+
+              def _qimage_to_pil(self, qimg: QImage) -> Image.Image:
+                  ba = QBuffer()
+                  ba.open(QIODevice.OpenModeFlag.WriteOnly)
+                  qimg.save(ba, "PNG")
+                  return Image.open(io.BytesIO(bytes(ba.data()))).convert("RGB")
+
+              def trigger_screen_snip(self):
+                  # Launches Windows 10 built-in Win+Shift+S Snip & Sketch overlay
+                  QDesktopServices.openUrl(QUrl("ms-screenclip:"))
+
+              def _on_clipboard_changed(self):
+                  if not self.config.get("auto_clipboard_snip", True):
+                      return
+                  cb = QApplication.clipboard()
+                  mime = cb.mimeData()
+                  if not (mime and mime.hasImage()):
+                      return
+                  qimg = cb.image()
+                  if qimg.isNull():
+                      return
+
+                  new_hash = self._current_clipboard_image_hash()
+                  if not new_hash or new_hash == self.last_clip_hash:
+                      return
+                  self.last_clip_hash = new_hash
+
+                  pil_img = self._qimage_to_pil(qimg)
+                  self.attached_pil_image = pil_img
+                  self.snip_badge_btn.setText(
+                      f"📎 Snip ({pil_img.width}×{pil_img.height}) ✕"
+                  )
+                  self.snip_badge_btn.show()
+
+                  # Pop open floating bar if minimized to floating button
+                  if self.orb_btn.isVisible():
+                      self.expand_from_orb()
+                  self.activateWindow()
+                  self.query_input.setFocus()
+
+                  # If Gemini Live mode is running, also stream the snip immediately
+                  if self.live_worker and self.live_worker.isRunning():
+                      self.live_worker.send_image(pil_img)
+
+              def clear_attached_snip(self):
+                  self.attached_pil_image = None
+                  self.snip_badge_btn.hide()
+
+              # -----------------------------------------------------------------------
+              # Display Rendering Helpers (KaTeX WebEngine + Fallback)
+              # -----------------------------------------------------------------------
+              def _ui_add_message(self, role: str, text: str):
+                  self.show_response_panel()
+                  if self.use_webengine:
+                      safe = json.dumps(text)
+                      self.web_view.page().runJavaScript(f"window.addMessage('{role}', {safe});")
+                  else:
+                      prefix = "<b>You:</b> " if role == "user" else "<b>Gemini:</b> "
+                      self.text_browser.append(f"<p>{prefix}{text}</p><hr>")
+
+              def _ui_stream_ai(self, text: str):
+                  self.show_response_panel()
+                  if self.use_webengine:
+                      safe = json.dumps(text)
+                      self.web_view.page().runJavaScript(f"window.updateStreamingAI({safe});")
+
+              def _ui_finalize_stream(self, full_text: str):
+                  if self.use_webengine:
+                      self.web_view.page().runJavaScript("window.finalizeStreamingAI();")
+                  else:
+                      self.text_browser.append(f"<p><b>Gemini:</b><br>{full_text}</p><hr>")
+
+              def _ui_clear_chat(self):
+                  if self.use_webengine:
+                      self.web_view.page().runJavaScript("window.clearChat();")
+                  else:
+                      self.text_browser.clear()
+
+              # -----------------------------------------------------------------------
+              # Query Submission (Normal, Hint Only, Step-by-Step, or Live Text)
+              # -----------------------------------------------------------------------
+              def submit_query(self, mode="normal"):
+                  api_key = self.config.get("api_key", "").strip()
+                  if not api_key:
+                      self.open_settings()
+                      return
+
+                  raw_query = self.query_input.text().strip()
+                  if mode == "hint":
+                      prompt = (
+                          (raw_query or "Look at this question.")
+                          + "\n\n[Instruction: Give ONLY a short conceptual hint and the relevant "
+                            "formula or first step. Do NOT reveal the final answer yet.]"
+                      )
+                      display_user = (raw_query or "📸 [Snip]") + " (💡 Hint Only)"
+                  elif mode == "steps":
+                      prompt = (
+                          (raw_query or "Solve the question shown in the image.")
+                          + "\n\n[Instruction: Solve this completely step-by-step. State the "
+                            "formula clearly, show each substitution, and highlight the final answer.]"
+                      )
+                      display_user = (raw_query or "📸 [Snip]") + " (📝 Step-by-Step)"
+                  else:
+                      if not raw_query and self.attached_pil_image is not None:
+                          prompt = "Solve and explain the question in this screenshot clearly."
+                          display_user = "📸 [Solve attached snip]"
+                      elif raw_query:
+                          prompt = raw_query
+                          display_user = raw_query
+                      else:
+                          return
+
+                  self.query_input.clear()
+
+                  # If Live Mode is active, route text (and any snip) over Live WebSocket
+                  if self.live_worker and self.live_worker.isRunning():
+                      self._ui_add_message("user", display_user)
+                      if self.attached_pil_image is not None:
+                          self.live_worker.send_image(self.attached_pil_image)
+                          self.clear_attached_snip()
+                      self.live_worker.send_text(prompt)
+                      return
+
+                  # Standard Streaming Chat Mode
+                  self.stop_active_generation()
+                  img_to_send = self.attached_pil_image
+                  if img_to_send is not None:
+                      display_user = "📎 " + display_user
+                  self._ui_add_message("user", display_user)
+                  self.clear_attached_snip()
+
+                  self.stop_btn.show()
+                  self.chat_worker = ChatStreamWorker(
+                      api_key=api_key,
+                      model_name=self.config.get("model_name", "gemini-3.8-flash"),
+                      thinking_level=self.config.get("thinking_level", "low"),
+                      system_instruction=self.config.get("custom_instructions", ""),
+                      history=self.chat_history,
+                      user_text=prompt,
+                      pil_image=img_to_send
+                  )
+                  self._pending_user_prompt = prompt
+                  self._pending_pil_image = img_to_send
+                  self.chat_worker.chunk_signal.connect(self._ui_stream_ai)
+                  self.chat_worker.done_signal.connect(self._on_chat_done)
+                  self.chat_worker.error_signal.connect(self._on_chat_error)
+                  self.chat_worker.start()
+
+              def _on_chat_done(self, full_text: str):
+                  self.stop_btn.hide()
+                  self._ui_finalize_stream(full_text)
+                  # Append turn to multi-turn follow-up memory
+                  parts = []
+                  if getattr(self, "_pending_pil_image", None) is not None:
+                      buf = io.BytesIO()
+                      self._pending_pil_image.convert("RGB").save(buf, format="JPEG", quality=85)
+                      parts.append(types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"))
+                  parts.append(types.Part.from_text(text=self._pending_user_prompt))
+                  self.chat_history.append(types.Content(role="user", parts=parts))
+                  self.chat_history.append(
+                      types.Content(role="model", parts=[types.Part.from_text(text=full_text)])
+                  )
+
+              def _on_chat_error(self, err_msg: str):
+                  self.stop_btn.hide()
+                  self._ui_add_message("status", f"⚠️ Error: {err_msg}")
+
+              def stop_active_generation(self):
+                  if self.chat_worker and self.chat_worker.isRunning():
+                      self.chat_worker.stop()
+                      self.chat_worker.wait(300)
+                  self.stop_btn.hide()
+
+              def reset_session(self):
+                  self.stop_active_generation()
+                  if self.live_worker and self.live_worker.isRunning():
+                      self.live_worker.stop()
+                  self.chat_history.clear()
+                  self.clear_attached_snip()
+                  self._ui_clear_chat()
+                  self._ui_add_message("status", "✨ Session cleared. Ready for a new question!")
+
+              # -----------------------------------------------------------------------
+              # Gemini Live WebSocket Mode
+              # -----------------------------------------------------------------------
+              def toggle_live_mode(self):
+                  if self.live_worker and self.live_worker.isRunning():
+                      self.live_worker.stop()
+                      return
+
+                  api_key = self.config.get("api_key", "").strip()
+                  if not api_key:
+                      self.open_settings()
+                      return
+
+                  self.live_btn.setText("🔴 Stop Live")
+                  self.live_btn.setStyleSheet(
+                      "background-color: rgba(242, 139, 130, 0.22); color: #F28B82; "
+                      "border: 1px solid #F28B82; border-radius: 10px; padding: 4px 9px; font-weight: 700;"
+                  )
+                  self.live_worker = LiveWebSocketWorker(
+                      api_key=api_key,
+                      live_model=self.config.get(
+                          "live_model_name", "gemini-2.5-flash-native-audio-preview-12-2025"
+                      ),
+                      system_instruction=self.config.get("custom_instructions", "")
+                  )
+                  self.live_worker.status_signal.connect(
+                      lambda msg: self._ui_add_message("status", msg)
+                  )
+                  self.live_worker.transcript_signal.connect(self._on_live_transcript)
+                  self.live_worker.error_signal.connect(
+                      lambda err: self._ui_add_message("status", f"⚠️ {err}")
+                  )
+                  self.live_worker.stopped_signal.connect(self._on_live_stopped)
+                  self.live_worker.start()
+
+                  # If a snip is already attached, send it once connected
+                  if self.attached_pil_image is not None:
+                      img_copy = self.attached_pil_image
+                      QTimer.singleShot(1500, lambda: self.live_worker.send_image(img_copy))
+
+              def _on_live_transcript(self, kind: str, text: str):
+                  if kind == "ai_stream":
+                      self._ui_stream_ai(text)
+                  elif kind == "ai_done":
+                      self._ui_finalize_stream(text)
+
+              def _on_live_stopped(self):
+                  self.live_btn.setText("🎙 Live")
+                  self.live_btn.setStyleSheet("")
+                  self._ui_add_message("status", "Live session ended.")
+
+              # -----------------------------------------------------------------------
+              # Settings Dialog Handler
+              # -----------------------------------------------------------------------
+              def open_settings(self):
+                  dlg = SettingsDialog(self, self.config)
+                  if dlg.exec() == QDialog.DialogCode.Accepted:
+                      self.config = load_config()
+                      self._update_badge()
+                      self._apply_opacity()
+
+
+          if __name__ == "__main__":
+              app = QApplication(sys.argv)
+              app.setQuitOnLastWindowClosed(True)
+              win = StudyAssistantApp()
+              win.show()
+              sys.exit(app.exec())
+          EOF
+
+      - name: Verify Python Syntax Before Packaging
+        shell: bash
+        run: |
+          python -m py_compile study_assistant.py
+
+      - name: Build Standalone Windows EXE with PyInstaller
+        shell: bash
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --name "GeminiStudyBar" \
+            --collect-all google.genai \
+            --collect-all sounddevice \
+            --hidden-import PIL.Image \
+            --hidden-import websockets \
+            --hidden-import aiohttp \
+            study_assistant.py
+
+      - name: Upload GeminiStudyBar.exe Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GeminiStudyBar-Windows10
+          path: dist/GeminiStudyBar.exe
